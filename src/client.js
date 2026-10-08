@@ -278,6 +278,11 @@ window.__ModuleLoader__.load({
           }
           this.animateOnce = true
           this.publish({ pending: false, dialog: null, hidden, loaded: true, loadError: false })
+          /* 重建官方聊天视图的历史源：被删的行当场消失，不必重启。 */
+          try {
+            const session = clientSessions?.binding?.(this.sessionId)?.session
+            if (session && typeof session.resync === 'function') Promise.resolve(session.resync()).catch(() => {})
+          } catch { /* 无此面时退化为插件自己的隐藏表 */ }
         } catch {
           this.publish({ pending: false, failure: 'generic' })
         }
@@ -651,7 +656,13 @@ window.__ModuleLoader__.load({
 
     // --- plugin ---------------------------------------------------------------
 
+    /* 客户端会话存储。删除成功后调官方的 Session.resync()：官方聊天视图按 append
+       事件渲染，不会因后续 replace 撤销已经画出来的行，所以必须重建历史源，
+       被删的行才会当场消失（不用重启/切会话）。 */
+    let clientSessions = null;
+
     function apply(ctx) {
+      clientSessions = ctx.sessions ?? null;
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-delete-turn: dictionaries')
 
       const controllers = new Map()
