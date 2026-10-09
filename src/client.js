@@ -662,7 +662,7 @@ window.__ModuleLoader__.load({
     let clientSessions = null;
 
     function apply(ctx) {
-      clientSessions = ctx.sessions ?? null;
+      clientSessions = { binding: (sessionId) => ctx.get('sessions')?.binding?.(sessionId) };
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-delete-turn: dictionaries')
 
       const controllers = new Map()
