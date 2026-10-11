@@ -18,7 +18,8 @@
 // the plugin loads on any profile and degrades to a clear HTTP failure when a
 // service is absent.
 import { randomUUID } from 'node:crypto'
-import { readFile, writeFile, rm } from 'node:fs/promises'
+import { readFile, writeFile, rm, rename } from 'node:fs/promises'
+import { readdirSync, existsSync } from 'node:fs'
 import { zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -146,7 +147,7 @@ async function flushSession(ctx, session) {
 }
 
 // --- 真删除：物理擦除会话日志中被删事件的内容 ---
-function redactEventPayload(event) {
+export function redactEventPayload(event) {
   if (!event || typeof event !== 'object' || !event.data || typeof event.data !== 'object') return event
   // 残余事件（assistant/attempt、llm/retry*）：只留定位字段，擦掉全部内容
   if (RESIDUE_TYPES.has(event.type)) {
@@ -174,6 +175,55 @@ function redactEventPayload(event) {
   return { ...event, data }
 }
 
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+
+/* 按**帧边界**切分 zstd 文件。
+   原实现用 `zstdDecompressSync(raw.subarray(i))`（从 magic 解到文件末尾）——
+   实测在 68 帧的会话上只读到 850/1310 行，少 460 行。它从没成功纯属侥幸：
+   一旦真跑通，会把少读的那 460 行事件直接从文件里抹掉。 */
+function splitFrames(buf) {
+  const idx = []
+  let i = -1
+  while ((i = buf.indexOf(ZSTD_MAGIC, i + 1)) !== -1) idx.push(i)
+  idx.push(buf.length)
+  const frames = []
+  for (let k = 0; k < idx.length - 1; k++) {
+    const raw = buf.subarray(idx[k], idx[k + 1])
+    frames.push({ raw, text: k === 0 ? null : zstdDecompressSync(raw).toString('utf8') })
+  }
+  return frames
+}
+
+/* 定位会话文件：persistence 优先；拿不到就自己扫 sessions 目录。
+   原实现只依赖 sessionPersistence.list/locate，服务缺席即静默返回
+   diskRewritten:false —— 这就是「purge 从没真正执行过」的原因。 */
+async function locateSessionFile(persistence, sessionId) {
+  try {
+    if (persistence && typeof persistence.list === 'function' && typeof persistence.locate === 'function') {
+      const entries = await persistence.list()
+      const wanted = idVariants(sessionId)
+      const meta = (entries || []).find((e) => wanted.has(e?.id) || wanted.has(e?.header?.id))
+      const loc = meta && persistence.locate(meta)
+      if (loc && loc.path && existsSync(loc.path)) return loc.path
+    }
+  } catch { /* 落到目录扫描 */ }
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+  const root = join(home, 'sessions')
+  let workspaces = []
+  try { workspaces = readdirSync(root) } catch { return undefined }
+  const wanted = idVariants(sessionId)
+  for (const ws of workspaces) {
+    let ids = []
+    try { ids = readdirSync(join(root, ws)) } catch { continue }
+    for (const id of ids) {
+      if (!wanted.has(id)) continue
+      const p = join(root, ws, id, 'session.v4.jsonl.zstd')
+      if (existsSync(p)) return p
+    }
+  }
+  return undefined
+}
+
 async function purgeDeletedEvents(ctx, sessionId, shadowedSeqs, replacementSeq) {
   const removeSet = new Set([...shadowedSeqs, replacementSeq])
   const redacted = []
@@ -189,43 +239,51 @@ async function purgeDeletedEvents(ctx, sessionId, shadowedSeqs, replacementSeq) 
       live.eventsSnapshot = undefined
     }
   } catch {}
-  try {
-    const persistence = ctx.get('sessionPersistence')
-    if (!persistence || typeof persistence.list !== 'function') return { redacted, diskRewritten: false }
-    const entries = await persistence.list()
-    const meta = entries.find((e) => e.id === sessionId)
-    if (!meta || typeof persistence.locate !== 'function') return { redacted, diskRewritten: false }
-    const location = persistence.locate(meta)
-    if (!location || !location.path) return { redacted, diskRewritten: false }
-    const filePath = location.path
-    const raw = await readFile(filePath)
-    const frameTexts = []
-    for (let i = 0; i < raw.length - 3; i++) {
-      if (raw[i] === 0x28 && raw[i + 1] === 0xb5 && raw[i + 2] === 0x2f && raw[i + 3] === 0xfd) {
-        try { frameTexts.push(zstdDecompressSync(raw.subarray(i)).toString('utf8')) } catch {}
-      }
+  /* 磁盘段：失败必须抛出。
+     原实现把失败吞成 diskRewritten:false、调用方再 catch 一次 ——
+     于是「真删除」悄悄退化成「只留墓碑」，正文原样留在文件里（2026-10-11 事故）。 */
+  const persistence = ctx.get('sessionPersistence')
+  const filePath = await locateSessionFile(persistence, sessionId)
+  if (!filePath) throw new Error(`purge: cannot locate session file for ${sessionId}`)
+  const raw = await readFile(filePath)
+  const frames = splitFrames(raw)
+  if (frames.length < 1) throw new Error('purge: session file has no zstd frame')
+
+  const parts = []
+  let before = 0
+  let changed = 0
+  for (let k = 0; k < frames.length; k++) {
+    const f = frames[k]
+    if (k === 0) { parts.push(f.raw); continue }   // header 帧原字节保留，勿重压
+    const lines = f.text.split('\n').filter((l) => l.trim())
+    before += lines.length
+    const out = []
+    for (const line of lines) {
+      let event
+      try { event = JSON.parse(line) } catch { out.push(line); continue }
+      if (typeof event.seq === 'number' && removeSet.has(event.seq)) {
+        out.push(JSON.stringify(redactEventPayload(event)))
+        changed++
+      } else out.push(line)
     }
-    if (frameTexts.length === 0) return { redacted, diskRewritten: false }
-    const allLines = []
-    for (const text of frameTexts) {
-      for (const line of text.split('\n')) {
-        if (!line.trim()) continue
-        try {
-          const event = JSON.parse(line)
-          allLines.push(removeSet.has(event.seq) ? JSON.stringify(redactEventPayload(event)) : line)
-        } catch { allLines.push(line) }
-      }
-    }
-    const compressed = zstdCompressSync(Buffer.from(allLines.join('\n') + '\n', 'utf8'))
-    await writeFile(filePath, compressed)
-    try {
-      const home = process.env.DSH_HOME || join(homedir(), '.dsh')
-      await rm(join(home, 'storages', 'session_projcache', 'sessions', sessionId + '.json'), { force: true })
-    } catch {}
-    return { redacted, diskRewritten: true }
-  } catch (error) {
-    return { redacted, diskRewritten: false, error: String((error && error.message) || error) }
+    parts.push(zstdCompressSync(Buffer.from(out.join('\n') + '\n', 'utf8')))
   }
+  if (changed === 0) return { redacted, diskRewritten: false, why: 'no matching rows' }
+
+  // 临时文件 + rename：绝不让半截写入损坏会话
+  const tmp = `${filePath}.purge-${Date.now()}`
+  await writeFile(tmp, Buffer.concat(parts))
+  // 安全阀：复读校验事件行数，任何丢行都拒绝提交（原实现会丢 460 行）
+  const vFrames = splitFrames(await readFile(tmp))
+  let vLines = 0
+  for (let k = 1; k < vFrames.length; k++) for (const l of vFrames[k].text.split('\n')) if (l.trim()) vLines++
+  if (vLines !== before) { await rm(tmp, { force: true }); throw new Error(`purge: 行数不一致 ${before}→${vLines}，拒绝写盘`) }
+  await rename(tmp, filePath)
+  try {
+    const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+    await rm(join(home, 'storages', 'session_projcache', 'sessions', sessionId + '.json'), { force: true })
+  } catch {}
+  return { redacted, diskRewritten: true, erased: changed, eventsVerified: vLines }
 }
 
 // --- operations --------------------------------------------------------------
@@ -336,7 +394,15 @@ async function deleteTarget(ctx, sessionId, body) {
   }
   const flush = await flushSession(ctx, session)
   let purged
-  try { purged = await purgeDeletedEvents(ctx, sessionId, [...plan.shadowed, ...residueSeqs], replacement.seq) } catch { purged = { redacted: [], diskRewritten: false } }
+  try {
+    purged = await purgeDeletedEvents(ctx, sessionId, [...plan.shadowed, ...residueSeqs], replacement.seq)
+  } catch (error) {
+    // 绝不静默：purge 失败 = 正文仍留在文件里，「真删除」退化成「只留墓碑」。
+    // 必须同时进响应体和控制台（原实现 `catch { purged = {...} }` 把事故吞掉了）。
+    const msg = String((error && error.message) || error)
+    purged = { redacted: [], diskRewritten: false, error: msg }
+    console.error(`[dsh-delete-turn] purge FAILED (sessionId=${sessionId}, shadowed=${JSON.stringify([...plan.shadowed])}): ${msg}`)
+  }
 
   return {
     replacementSeq: replacement.seq,
