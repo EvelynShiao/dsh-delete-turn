@@ -147,6 +147,27 @@ async function flushSession(ctx, session) {
 }
 
 // --- 真删除：物理擦除会话日志中被删事件的内容 ---
+/* 要擦的文本键 —— 与 dsh-adapter-compat/purge.js 的 TEXT_KEYS 同一份清单（三插件同步规矩）。 */
+const TEXT_KEYS = new Set(['text', 'texts', 'delta', 'deltas', 'reasoning', 'reasoning_content', 'reasoningContent', 'thinking'])
+/* 按 key 名深度擦文本：只清字符串，键/数组长度/chunk 结构原样保留。
+   插件之间不互相 import，这里内联一份同语义实现。 */
+function scrubDeep(node, depth = 0) {
+  if (depth > 14 || node === null || typeof node !== 'object') return node
+  for (const key of Object.keys(node)) {
+    const value = node[key]
+    if (TEXT_KEYS.has(key)) {
+      if (typeof value === 'string') node[key] = ''
+      else if (Array.isArray(value)) node[key] = value.map((x) => (typeof x === 'string' ? '' : x))
+      else if (value && typeof value === 'object') {
+        for (const inner of Object.keys(value)) if (typeof value[inner] === 'string') value[inner] = ''
+      }
+      continue
+    }
+    if (value && typeof value === 'object') scrubDeep(value, depth + 1)
+  }
+  return node
+}
+
 export function redactEventPayload(event) {
   if (!event || typeof event !== 'object' || !event.data || typeof event.data !== 'object') return event
   // 残余事件（assistant/attempt、llm/retry*）：只留定位字段，擦掉全部内容
@@ -155,6 +176,24 @@ export function redactEventPayload(event) {
     const keep = {}
     for (const k of ['turn', 'step', 'retryId', 'attemptId', 'reason']) {
       if (d[k] !== undefined) keep[k] = d[k]
+    }
+    /* stream 必须留住（2026-10-12 复发根因，同 2026-10-09 adapter-compat 那次）：
+       宿主种子校验要求 assistant/attempt 的 turn/step 为整数且 **stream 是数组**，
+       丢掉这个键 gateway 就报 `seed assistant/attempt at index N has invalid settlement
+       fields` → 整个会话打不开。旧实现用白名单只留 5 个标量，stream 被连带丢弃，
+       于是「只要在对话里删除东西就坏」。
+       正确做法与 adapter-compat purge.js 的 RESIDUE 分支一致：**保留数组与 chunk 结构，
+       只把文本擦空**（真删除语义不变，正文照样一个字节读不到）。
+       必须 structuredClone：scrubDeep 是原地深擦，直接擦 event.data.stream 会把宿主
+       内存里的同一批对象一起改坏（内存与磁盘就此分叉）。 */
+    if (d.stream !== undefined) {
+      try {
+        keep.stream = Array.isArray(d.stream) ? scrubDeep(structuredClone(d.stream)) : []
+      } catch {
+        keep.stream = [] // 深拷贝失败也绝不能让键消失
+      }
+    } else if (event.type === 'assistant/attempt') {
+      keep.stream = [] // 本就没有 stream 的 attempt：补空数组以满足 settlement 校验
     }
     return { ...event, data: keep }
   }
