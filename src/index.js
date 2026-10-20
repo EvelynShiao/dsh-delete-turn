@@ -149,6 +149,8 @@ async function flushSession(ctx, session) {
 // --- 真删除：物理擦除会话日志中被删事件的内容 ---
 /* 要擦的文本键 —— 与 dsh-adapter-compat/purge.js 的 TEXT_KEYS 同一份清单（三插件同步规矩）。 */
 const TEXT_KEYS = new Set(['text', 'texts', 'delta', 'deltas', 'reasoning', 'reasoning_content', 'reasoningContent', 'thinking'])
+/* 占位正文：与 adapter-compat/purge.js、slim.js 的 [内容已清除] 统一（三插件同步规矩）。 */
+const TEXT_PLACEHOLDER = '[内容已清除]'
 /* 按 key 名深度擦文本：只清字符串，键/数组长度/chunk 结构原样保留。
    插件之间不互相 import，这里内联一份同语义实现。 */
 function scrubDeep(node, depth = 0) {
@@ -170,32 +172,45 @@ function scrubDeep(node, depth = 0) {
 
 export function redactEventPayload(event) {
   if (!event || typeof event !== 'object' || !event.data || typeof event.data !== 'object') return event
-  // 残余事件（assistant/attempt、llm/retry*）：只留定位字段，擦掉全部内容
+  /* 残余事件（assistant/attempt、llm/retry*）：**只擦文本载体，结构标量一个都不动**。
+     2026-10-20 实锤（session-beae66b3）：旧实现用白名单只留 turn/step/retryId/attemptId/reason，
+     把宿主校验必需的 llm/retry.provider / mode / policyKey / retry / delayMs / failure
+     和 llm/retry-started.retry 一起吃掉 → 加载直接抛
+       "retry must be a non-negative safe integer"，整个会话打不开。
+     跟 2026-10-12 那次 stream 被吃掉是**同一个 bug 换了个字段**：白名单永远会漏。
+     正确手法（与 adapter-compat/purge.js 的 RESIDUE 分支一致）：**黑名单** —— 只删文本键，
+     其余原样保留。真删除语义不变（正文照样一个字节读不到）。 */
   if (RESIDUE_TYPES.has(event.type)) {
-    const d = event.data
-    const keep = {}
-    for (const k of ['turn', 'step', 'retryId', 'attemptId', 'reason']) {
-      if (d[k] !== undefined) keep[k] = d[k]
+    const data = structuredClone(event.data)
+    for (const k of ['content', 'text', 'messages', 'prompt', 'reasoning', 'reasoning_content', 'reasoningContent', 'thinking']) {
+      if (data[k] !== undefined) delete data[k]
     }
-    /* stream 必须留住（2026-10-12 复发根因，同 2026-10-09 adapter-compat 那次）：
-       宿主种子校验要求 assistant/attempt 的 turn/step 为整数且 **stream 是数组**，
-       丢掉这个键 gateway 就报 `seed assistant/attempt at index N has invalid settlement
-       fields` → 整个会话打不开。旧实现用白名单只留 5 个标量，stream 被连带丢弃，
-       于是「只要在对话里删除东西就坏」。
-       正确做法与 adapter-compat purge.js 的 RESIDUE 分支一致：**保留数组与 chunk 结构，
-       只把文本擦空**（真删除语义不变，正文照样一个字节读不到）。
-       必须 structuredClone：scrubDeep 是原地深擦，直接擦 event.data.stream 会把宿主
-       内存里的同一批对象一起改坏（内存与磁盘就此分叉）。 */
-    if (d.stream !== undefined) {
-      try {
-        keep.stream = Array.isArray(d.stream) ? scrubDeep(structuredClone(d.stream)) : []
-      } catch {
-        keep.stream = [] // 深拷贝失败也绝不能让键消失
-      }
+    /* stream 必须留住且结构不动（宿主种子校验要求 attempt 的 stream 是数组）：
+       只把里面的文本擦空。必须 structuredClone 后再擦，绝不改宿主内存里的同一批对象。 */
+    if (data.stream !== undefined) {
+      try { scrubDeep({ stream: data.stream }) } catch { /* 保结构优先，擦失败不阻断 */ }
     } else if (event.type === 'assistant/attempt') {
-      keep.stream = [] // 本就没有 stream 的 attempt：补空数组以满足 settlement 校验
+      data.stream = [] // 本就没有 stream 的 attempt：补空数组以满足 settlement 校验
     }
-    return { ...event, data: keep }
+    return { ...event, data }
+  }
+  /* developer/message 的 content 装的是 tool-addition/tool-removal 结构块，不是对话正文：
+     整块清空会让 headerSeq 失去依据，宿主抛
+       "format v4 developer/message must omit headerSeq without tool additions"
+     （2026-10-20 实证 session-4ce9464e）。这里只擦块里的文本，块本身保留。 */
+  if (event.type === 'developer/message') {
+    const data = structuredClone(event.data)
+    if (data.message && typeof data.message === 'object') {
+      const msg = { ...data.message }
+      if (Array.isArray(msg.content)) {
+        msg.content = msg.content.map((b) => (b && typeof b === 'object' && typeof b.text === 'string' ? { ...b, text: '' } : b))
+      }
+      data.message = msg
+    }
+    const blocks = data.message?.content
+    const hasAdd = Array.isArray(blocks) && blocks.some((b) => b && b.type === 'tool-addition')
+    if (!hasAdd && Object.hasOwn(data, 'headerSeq')) delete data.headerSeq
+    return { ...event, data }
   }
   const data = { ...event.data }
   if (Array.isArray(data.content)) data.content = []
@@ -211,6 +226,21 @@ export function redactEventPayload(event) {
   if (typeof data.result === 'string') data.result = ''
   if (data.output && typeof data.output === 'object') data.output = {}
   if (typeof data.output === 'string') data.output = ''
+  /* assistant/message 的推理与正文**也**存放在 data.stream 的 chunk 文本里，
+     只清 message.content 会留残留（2026-10-11 实锤，adapter purge.js 同款教训）。
+     只擦文本、结构不动；先 structuredClone 再擦，绝不动入参里的同一批对象。 */
+  if (Array.isArray(data.stream)) {
+    try { data.stream = scrubDeep({ stream: structuredClone(data.stream) }).stream } catch { /* 保结构优先，擦失败不阻断 */ }
+  }
+  /* 出口修（与 adapter-compat/purge.js 同款占位符）：擦完不能留「正文全空的 tool 结果」——
+     provider（Anthropic 风格）把 tool_result.content=[] 当成没有结果，整轮拒收：
+       `tool_use` ids were found without `tool_result` blocks immediately after
+     清空语义不变（正文确实没了），但结构合法。 */
+  if (event.type === 'tool/result' && data.message && typeof data.message === 'object') {
+    const blocks = Array.isArray(data.message.content) ? data.message.content : []
+    const hasText = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
+    if (!hasText) data.message = { ...data.message, content: [{ type: 'text', text: TEXT_PLACEHOLDER }] }
+  }
   return { ...event, data }
 }
 
