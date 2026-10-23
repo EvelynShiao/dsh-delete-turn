@@ -216,7 +216,17 @@ export function redactEventPayload(event) {
   if (Array.isArray(data.content)) data.content = []
   if (data.message && typeof data.message === 'object') {
     const msg = { ...data.message }
-    if (Array.isArray(msg.content)) msg.content = []
+    /* tool-call 宣告块幸存（2026-10-23 源头修，与 session-kit / adapter-compat 十二批同步）：
+       assistant/message 的 content 不只是正文——它同时是 tool/call 的**宣告登记处**。
+       宿主校验规定每个 tool/call 事件必须在同 turn/step 的 assistant/message content 里有
+       id/name/arguments 全等的 tool-call 块；整块清空会让下游 tool/call 全变
+       「has no advertised tool lifecycle」孤儿，会话重启即打不开
+       （2026-10-22 实锤 session-f3bc4fd2：108/244 个 tool/call 变孤儿）。
+       手法：只清正文类块（text/reasoning），tool-call 结构块原样保留——
+       id/name/arguments 本来就不是对话正文，留着不泄密；真删除语义不变。 */
+    if (Array.isArray(msg.content)) {
+      msg.content = msg.content.filter((b) => b && b.type === 'tool-call')
+    }
     if (typeof msg.text === 'string') msg.text = ''
     if (typeof msg.reasoning_content === 'string') msg.reasoning_content = ''
     if (typeof msg.reasoning === 'string') msg.reasoning = ''
